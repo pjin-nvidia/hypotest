@@ -2,12 +2,14 @@
 
 import asyncio
 import json
+import ssl
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from hypotest.env.kernel_server import NBLanguage
 from hypotest.env.sandbox import CapsuleRef, ResourceSpec, SandboxConfig
@@ -34,6 +36,9 @@ class _FakeConnectionConfig:
         return self._api_key
 
     def get_base_url(self):
+        # Mirror the SDK: a scheme in ``domain`` overrides ``protocol``.
+        if self.domain.startswith(("http://", "https://")):
+            return f"{self.domain}/v1"
         return f"{self.protocol}://{self.domain}/v1"
 
 
@@ -925,3 +930,173 @@ async def test_kernel_proxy_authentication_error_is_surfaced_and_remote_is_close
     assert exc_info.value.response.status_code == 401
     assert remote.killed is True
     assert remote.closed is True
+
+
+# Public self-signed test certificate (CN=opensandbox-test-ca); its key was discarded.
+_TEST_CA_PEM = """\
+-----BEGIN CERTIFICATE-----
+MIIDbTCCAlWgAwIBAgIUEMe7dAcyeJhNtto0CEk8uye2L3owDQYJKoZIhvcNAQEL
+BQAwNzEXMBUGA1UECgwOaHlwb3Rlc3QgdGVzdHMxHDAaBgNVBAMME29wZW5zYW5k
+Ym94LXRlc3QtY2EwIBcNMjYwOTI5MjIzMzI1WhgPMjEyNjA5MDUyMjMzMjVaMDcx
+FzAVBgNVBAoMDmh5cG90ZXN0IHRlc3RzMRwwGgYDVQQDDBNvcGVuc2FuZGJveC10
+ZXN0LWNhMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAy7HL7AI9aj/B
+xgXbFxFmXTD0wvu7fbzXtZ4ogAzYMCOx++ag6GGLi5UT+qrijf0+Gig2F/7q1ZOX
+g3b75nZXESQKRp0T0yqSuaKbsUsV5dOdQc/7MQnBWHQzsEatxx9q/RvH0EQ2w+2M
+iPspDoqjyCNYIKHk4s0YQTQh39R5cLXF8H1KEwaSzuVJigOzld0KdqNBbVfGa/a0
+mVq/tCGuGagxH3exdNxKBsWa+TEOj1+oTWCPiJ8+Ll/XgKrbm2BSBDiyijOgmnXZ
+gC5vUlB2A+dLDeKe8gFR+kz2MzEMKIlrLhejceIyp812D4y5GHDJcQsMDtRSrUpl
+RE3nmyzYsQIDAQABo28wbTAdBgNVHQ4EFgQUG7MeUSCXiqpuS8eI2AVS8CkpR5Yw
+HwYDVR0jBBgwFoAUG7MeUSCXiqpuS8eI2AVS8CkpR5YwDwYDVR0TAQH/BAUwAwEB
+/zAaBgNVHREEEzARgg9zYW5kYm94LmV4YW1wbGUwDQYJKoZIhvcNAQELBQADggEB
+AIZLDmda6CgVSQ5XZPNaR9KUjJV9jSK44EJwqeDFUfj/qaZ8cdVu6COCd4A2PVoA
+qFKmWK0qY2Y8ETOtetxdkmGDUUkx4ye1KFwV0qbLp9pklBID0b5npw8+cCVuUfC2
+Kb6Bp7MHJ7N56/lv+w0QqUKBLmFZJGl5Wkok4L3KXJ/uYrmo0gM3cuVTjtLDD6Tx
+NeC/7f7ruUNNwcZX4SVOO0z5l1bU/H3WzQ3JWQ6wX3jIc1hJWKC1cw4pu4TSHXXi
+pVrLEg1r4xW219AV6/xPcf5gcL01MAPMfvGDU7SgSpyc9iP84oNwif6p29iAd+B/
+o3SFe9inGWAg5sGBeoQvfHM=
+-----END CERTIFICATE-----
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("domain", "protocol", "expected_scheme"),
+    [
+        # Regression: an https:// domain used to leave kernel requests on the
+        # SDK's default http protocol, which HTTPS-only servers never answer.
+        ("https://sandbox.example", None, "https"),
+        ("sandbox.example", "https", "https"),
+        ("http://sandbox.example", None, "http"),
+        ("sandbox.example", None, "http"),
+    ],
+)
+async def test_kernel_endpoint_scheme_follows_effective_lifecycle_scheme(
+    tmp_path, monkeypatch, domain, protocol, expected_scheme
+):
+    _FakeConnectionConfig.created.clear()
+    remote, _, requests = _install_fakes(monkeypatch)
+    sandbox = OpenSandboxSandbox(
+        SandboxConfig(work_dir=tmp_path, language=NBLanguage.PYTHON),
+        OpenSandboxSpec(
+            image="registry/kernel:latest",
+            domain=domain,
+            protocol=protocol,
+            create_attempts=1,
+            health_poll_interval_seconds=0.001,
+        ),
+    )
+    try:
+        await sandbox.start()
+        assert requests
+        assert {request.url.scheme for request in requests} == {expected_scheme}
+        assert all(request.url.path.startswith("/sandboxes/sb-123/proxy/8000/") for request in requests)
+    finally:
+        await sandbox.close()
+    assert remote.killed is True
+
+
+def _record_transport_verify(monkeypatch) -> list[Any]:
+    recorded: list[Any] = []
+    real_transport = httpx.AsyncHTTPTransport
+
+    def transport_factory(**kwargs):
+        recorded.append(kwargs.get("verify"))
+        return real_transport(**kwargs)
+
+    monkeypatch.setattr(opensandboxmod.httpx, "AsyncHTTPTransport", transport_factory)
+    return recorded
+
+
+@pytest.mark.asyncio
+async def test_tls_ca_path_is_added_to_default_trust_for_shared_transports(tmp_path, monkeypatch):
+    ca_path = tmp_path / "server-ca.pem"
+    ca_path.write_text(_TEST_CA_PEM)
+    _FakeConnectionConfig.created.clear()
+    _install_fakes(monkeypatch)
+    verify_args = _record_transport_verify(monkeypatch)
+    sandbox = OpenSandboxSandbox(
+        SandboxConfig(work_dir=tmp_path / "work", language=NBLanguage.PYTHON),
+        OpenSandboxSpec(
+            image="registry/kernel:latest",
+            tls_ca_path=str(ca_path),
+            create_attempts=1,
+            health_poll_interval_seconds=0.001,
+        ),
+    )
+    try:
+        await sandbox.start()
+        # Lifecycle and kernel transports share one context.
+        assert len(verify_args) == 2
+        assert verify_args[0] is verify_args[1]
+        context = verify_args[0]
+        assert isinstance(context, ssl.SSLContext)
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname is True
+        subjects = [dict(field[0] for field in cert["subject"]) for cert in context.get_ca_certs()]
+        assert {"organizationName": "hypotest tests", "commonName": "opensandbox-test-ca"} in subjects
+        # Additive: the default public roots are still trusted.
+        assert len(subjects) > 1
+        # The SDK receives the verified lifecycle transport for lifecycle calls.
+        assert sandbox._client_pool is not None
+        assert _FakeConnectionConfig.created[-1]["transport"] is sandbox._client_pool.lifecycle_transport
+    finally:
+        await sandbox.close()
+
+
+@pytest.mark.asyncio
+async def test_without_tls_ca_path_transports_keep_httpx_default_verification(tmp_path, monkeypatch):
+    _install_fakes(monkeypatch)
+    verify_args = _record_transport_verify(monkeypatch)
+    sandbox = OpenSandboxSandbox(
+        SandboxConfig(work_dir=tmp_path, language=NBLanguage.PYTHON),
+        OpenSandboxSpec(image="registry/kernel:latest", create_attempts=1, health_poll_interval_seconds=0.001),
+    )
+    try:
+        await sandbox.start()
+        assert verify_args == [True, True]
+    finally:
+        await sandbox.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_tls_ca_path_fails_before_create(tmp_path, monkeypatch):
+    _, create_kwargs, _ = _install_fakes(monkeypatch)
+    sandbox = OpenSandboxSandbox(
+        SandboxConfig(work_dir=tmp_path, language=NBLanguage.PYTHON),
+        OpenSandboxSpec(image="registry/kernel:latest", tls_ca_path=str(tmp_path / "missing.pem")),
+    )
+
+    with pytest.raises(FileNotFoundError, match="tls_ca_path"):
+        await sandbox.start()
+
+    assert create_kwargs == {}
+    assert sandbox._client_pool is None
+
+
+def test_blank_tls_ca_path_is_rejected():
+    with pytest.raises(ValidationError, match="tls_ca_path cannot be blank"):
+        OpenSandboxSpec(image="registry/kernel:latest", tls_ca_path="  ")
+
+
+@pytest.mark.asyncio
+async def test_tls_ca_path_is_part_of_shared_client_pool_identity(tmp_path, monkeypatch):
+    ca_path = tmp_path / "server-ca.pem"
+    ca_path.write_text(_TEST_CA_PEM)
+    _install_fakes(monkeypatch)
+    common = {"image": "registry/kernel:latest", "create_attempts": 1, "health_poll_interval_seconds": 0.001}
+    default_trust = OpenSandboxSandbox(
+        SandboxConfig(work_dir=tmp_path / "a", language=NBLanguage.PYTHON),
+        OpenSandboxSpec(**common),
+    )
+    extra_ca = OpenSandboxSandbox(
+        SandboxConfig(work_dir=tmp_path / "b", language=NBLanguage.PYTHON),
+        OpenSandboxSpec(**common, tls_ca_path=str(ca_path)),
+    )
+    try:
+        await asyncio.gather(default_trust.start(), extra_ca.start())
+        assert default_trust._client_pool is not None
+        assert extra_ca._client_pool is not None
+        assert default_trust._client_pool is not extra_ca._client_pool
+    finally:
+        await default_trust.close()
+        await extra_ca.close()

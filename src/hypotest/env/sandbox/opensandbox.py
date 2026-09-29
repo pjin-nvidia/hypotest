@@ -24,12 +24,15 @@ import hashlib
 import logging
 import os
 import re
+import ssl
 import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
@@ -122,11 +125,16 @@ class OpenSandboxSpec(BaseModel):
     image_auth: OpenSandboxImageAuth | None = None
 
     # Leave these unset to use the OpenSandbox SDK's canonical OPEN_SANDBOX_*
-    # environment variables and default protocol.
+    # environment variables and default protocol. A scheme in ``domain``
+    # (e.g. ``https://host``) also selects the kernel endpoint scheme.
     domain: str | None = None
     api_key: str | None = None
     protocol: Literal["http", "https"] | None = None
     use_server_proxy: bool = True
+    # Extra PEM CA bundle trusted for OpenSandbox lifecycle and kernel HTTPS,
+    # e.g. a server's self-signed certificate. It is added to the default
+    # trust store (certifi, or SSL_CERT_FILE/SSL_CERT_DIR), not substituted.
+    tls_ca_path: str | None = None
 
     request_timeout_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
     create_timeout_seconds: float = Field(default=600.0, gt=0, allow_inf_nan=False)
@@ -228,6 +236,8 @@ class OpenSandboxSpec(BaseModel):
                 raise ValueError("mounted_capsule_root cannot be blank")
             if not self.mounted_capsule_root.startswith("/"):
                 raise ValueError("mounted_capsule_root must be an absolute container path")
+        if self.tls_ca_path is not None and not self.tls_ca_path.strip():
+            raise ValueError("tls_ca_path cannot be blank")
         return self
 
     @model_validator(mode="after")
@@ -347,6 +357,35 @@ def _endpoint_url(endpoint: str, protocol: str) -> str:
     return f"{protocol}://{endpoint.rstrip('/')}/"
 
 
+def _connection_scheme(connection_config: Any) -> str:
+    """Return the scheme the lifecycle client actually uses.
+
+    The SDK lets a scheme in ``domain`` override ``protocol`` for lifecycle
+    calls, while ``protocol`` itself keeps its ``http`` default. Deriving the
+    kernel endpoint scheme from the effective base URL keeps both on the same
+    scheme (e.g. an HTTPS-only server addressed as ``https://host``).
+    """
+    get_base_url = getattr(connection_config, "get_base_url", None)
+    if callable(get_base_url):
+        scheme = urlsplit(str(get_base_url())).scheme.lower()
+        if scheme in {"http", "https"}:
+            return scheme
+    return getattr(connection_config, "protocol", None) or "http"
+
+
+def _ssl_context(tls_ca_path: str | None) -> ssl.SSLContext | None:
+    """Default trust store plus an optional extra CA bundle; None keeps httpx defaults."""
+    if tls_ca_path is None:
+        return None
+    path = Path(tls_ca_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"OpenSandbox tls_ca_path does not exist or is not a file: {path}")
+    # httpx's default context honors SSL_CERT_FILE/SSL_CERT_DIR, else certifi.
+    context = httpx.create_ssl_context()
+    context.load_verify_locations(cafile=str(path))
+    return context
+
+
 def _is_transient_remote_error(exc: Exception, *, endpoint_readiness: bool = False) -> bool:
     """Classify remote failures without hiding authentication/configuration errors."""
     if isinstance(exc, (ConnectionError, OSError, TimeoutError, httpx.TransportError)):
@@ -381,6 +420,7 @@ class _OpenSandboxClientPoolKey:
     kernel_max_keepalive_connections: int
     kernel_request_concurrency: int
     keepalive_expiry_seconds: float
+    tls_ca_path: str | None
 
 
 @dataclass(slots=True)
@@ -445,6 +485,7 @@ def _client_pool_key(connection_config: Any, spec: OpenSandboxSpec) -> _OpenSand
         kernel_max_keepalive_connections=spec.kernel_max_keepalive_connections,
         kernel_request_concurrency=spec.kernel_request_concurrency,
         keepalive_expiry_seconds=spec.http_keepalive_expiry_seconds,
+        tls_ca_path=spec.tls_ca_path,
     )
 
 
@@ -459,19 +500,24 @@ async def _acquire_client_pool(
         pool.references += 1
         return pool
 
+    # None preserves httpx's default verification; the context is shared by
+    # both transports and, via ConnectionConfig.transport, SDK lifecycle calls.
+    verify: ssl.SSLContext | bool = _ssl_context(spec.tls_ca_path) or True
     lifecycle_transport = httpx.AsyncHTTPTransport(
+        verify=verify,
         limits=httpx.Limits(
             max_connections=spec.lifecycle_max_connections,
             max_keepalive_connections=spec.lifecycle_max_keepalive_connections,
             keepalive_expiry=spec.http_keepalive_expiry_seconds,
-        )
+        ),
     )
     kernel_transport = httpx.AsyncHTTPTransport(
+        verify=verify,
         limits=httpx.Limits(
             max_connections=spec.kernel_max_connections,
             max_keepalive_connections=spec.kernel_max_keepalive_connections,
             keepalive_expiry=spec.http_keepalive_expiry_seconds,
-        )
+        ),
     )
     try:
         kernel_client = httpx.AsyncClient(
@@ -780,7 +826,7 @@ class OpenSandboxSandbox(Sandbox):
                 f"OpenSandbox kernel endpoint was unavailable for {self._spec.ready_timeout_seconds:g}s: {last_error}"
             ) from last_error
 
-        protocol = getattr(connection_config, "protocol", None) or "http"
+        protocol = _connection_scheme(connection_config)
         headers = dict(getattr(endpoint, "headers", {}) or {})
         if self._spec.use_server_proxy:
             get_api_key = getattr(connection_config, "get_api_key", None)
